@@ -7,13 +7,13 @@
 #include <linux/ipc.h>
 #include <linux/net.h>
 #include <linux/perf_event.h>
-#include <linux/prctl.h>
 #include <linux/unistd.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/personality.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -945,7 +945,7 @@ void Task::move_ip_before_breakpoint() {
   set_regs(r);
 }
 
-bool Task::enter_syscall(bool allow_exit) {
+bool Task::enter_syscall(SupportedArch syscall_arch, bool allow_exit) {
   bool need_ptrace_syscall_event = !seccomp_bpf_enabled ||
                                    session().syscall_seccomp_ordering() ==
                                        Session::SECCOMP_BEFORE_PTRACE_SYSCALL;
@@ -985,11 +985,11 @@ bool Task::enter_syscall(bool allow_exit) {
     static_cast<RecordTask*>(this)->stash_sig();
   }
   apply_syscall_entry_regs();
-  canonicalize_regs(arch());
+  canonicalize_regs(syscall_arch);
   return true;
 }
 
-bool Task::exit_syscall() {
+bool Task::exit_syscall(SupportedArch syscall_arch) {
   // If PTRACE_SYSCALL_BEFORE_SECCOMP, we are inconsistent about
   // whether we process the syscall on the syscall entry trap or
   // on the seccomp trap. Detect if we are on the former and
@@ -1011,7 +1011,7 @@ bool Task::exit_syscall() {
     }
     ASSERT(this, !ptrace_event());
     if (!stop_sig()) {
-      canonicalize_regs(arch());
+      canonicalize_regs(syscall_arch);
       break;
     }
     if (ReplaySession::is_ignored_signal(stop_sig()) &&
@@ -1024,16 +1024,16 @@ bool Task::exit_syscall() {
   return true;
 }
 
-bool Task::exit_syscall_and_prepare_restart() {
+bool Task::exit_syscall_and_prepare_restart(SupportedArch syscall_arch) {
   Registers r = regs();
   int syscallno = r.original_syscallno();
   LOG(debug) << "exit_syscall_and_prepare_restart from syscall "
-             << rr::syscall_name(syscallno, r.arch());
-  r.set_original_syscallno(syscall_number_for_gettid(r.arch()));
+             << rr::syscall_name(syscallno, syscall_arch);
+  r.set_original_syscallno(syscall_number_for_gettid(syscall_arch));
   set_regs(r);
   // This exits the hijacked SYS_gettid.  Now the tracee is
   // ready to do our bidding.
-  if (!exit_syscall()) {
+  if (!exit_syscall(syscall_arch)) {
     // The tracee unexpectedly exited. To get this to replay correctly, we need to
     // make it look like we really entered the syscall. Then
     // handle_ptrace_exit_event will record something appropriate.
@@ -1048,7 +1048,7 @@ bool Task::exit_syscall_and_prepare_restart() {
   // the tracee trapped at the syscall.
   r.set_original_syscallno(-1);
   r.set_syscallno(syscallno);
-  r.set_ip(r.ip() - syscall_instruction_length(r.arch()));
+  r.set_ip(r.ip() - syscall_instruction_length(syscall_arch));
   set_regs(r);
   return true;
 }
@@ -4351,6 +4351,30 @@ void Task::did_handle_ptrace_exit_event() {
   handled_ptrace_exit_event_ = true;
 }
 
+template <typename Arch>
+static void setup_exec_args_arch(Task* t, const std::string& filename,
+    remote_ptr<void> remote_mem, Registers& regs) {
+  auto argv = remote_mem.cast<typename Arch::size_t>();
+  auto argv0 = argv + 1;
+  auto zero_word = argv0 + 1;
+  remote_ptr<void> filename_addr = zero_word + 1;
+  typename Arch::size_t words[] = {
+    static_cast<typename Arch::size_t>(argv0.as_int()),
+    static_cast<typename Arch::size_t>(zero_word.as_int()),
+    0
+  };
+  t->write_mem(argv, words, 3);
+  t->write_bytes_helper(filename_addr, filename.size() + 1, filename.c_str());
+  regs.set_arg1(filename_addr);
+  regs.set_arg2(argv);
+  regs.set_arg3(zero_word);
+}
+
+static void setup_exec_args(Task* t, const std::string& filename,
+    remote_ptr<void> remote_mem, Registers& regs) {
+  RR_ARCH_FUNCTION(setup_exec_args_arch, t->arch(), t, filename, remote_mem, regs);
+}
+
 void Task::os_exec(SupportedArch exec_arch, std::string filename)
 {
   // Setup memory and registers for the execve call. We may not have to save
@@ -4373,23 +4397,13 @@ void Task::os_exec(SupportedArch exec_arch, std::string filename)
   regs.set_ip(vm()->traced_syscall_ip());
   remote_ptr<void> remote_mem = floor_page_size(regs.sp());
 
-  // Determine how much memory we'll need
-  size_t filename_size = filename.size() + 1;
-  size_t total_size = filename_size + sizeof(size_t);
+  // Determine how much memory we'll need (upper bound)
+  size_t total_size = filename.size() + 1 + 2*sizeof(size_t);
   if (memory_task != this) {
     saved_data = read_mem(remote_mem.cast<uint8_t>(), total_size);
   }
 
-  // We write a zero word in the host size, not t's size, but that's OK,
-  // since the host size must be bigger than t's size.
-  // We pass no argv or envp, so exec params 2 and 3 just point to the NULL
-  // word.
-  write_mem(remote_mem.cast<size_t>(), size_t(0));
-  regs.set_arg2(remote_mem);
-  regs.set_arg3(remote_mem);
-  remote_ptr<void> filename_addr = remote_mem + sizeof(size_t);
-  write_bytes_helper(filename_addr, filename_size, filename.c_str());
-  regs.set_arg1(filename_addr);
+  setup_exec_args(this, filename, remote_mem, regs);
   /* The original_syscallno is execve in the old architecture. The kernel does
    * not update the original_syscallno when the architecture changes across
    * an exec.
@@ -4401,7 +4415,7 @@ void Task::os_exec(SupportedArch exec_arch, std::string filename)
   set_regs(regs);
 
   LOG(debug) << "Beginning execve" << this->regs();
-  enter_syscall();
+  enter_syscall(exec_arch);
   ASSERT(this, !stop_sig()) << "exec failed on entry";
   /* Complete the syscall. The tid of the task will be the thread-group-leader
    * tid, no matter what tid it was before.

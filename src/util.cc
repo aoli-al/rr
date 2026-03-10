@@ -13,13 +13,13 @@
 #include <limits.h>
 #include <linux/capability.h>
 #include <linux/magic.h>
-#include <linux/prctl.h>
 #include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -2159,7 +2159,7 @@ int choose_cpu(BindCPU bind_cpu, ScopedFd &cpu_lock_fd_out) {
   return cpus[random() % cpus.size()];
 }
 
-uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len) {
+uint32_t update_crc32(uint32_t crc, unsigned char* buf, size_t len) {
   static const uint32_t crc32_table[256] = {
     0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f,
     0xe963a535, 0x9e6495a3, 0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988,

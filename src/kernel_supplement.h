@@ -570,6 +570,11 @@ enum {
 #define MEMREAD _IOWR('M', 26, typename Arch::mtd_read_req)
 #endif
 
+// New in the 6.3 kernel
+#ifndef PR_GET_MDWE
+#define PR_GET_MDWE 66
+#endif
+
 // New in the 6.4 kernel
 #ifndef PR_GET_AUXV
 #define PR_GET_AUXV 0x41555856
@@ -613,6 +618,10 @@ struct dma_buf_export_sync_file {
 
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE 1
+#endif
+
+#ifndef ZFS_SUPER_MAGIC
+#define ZFS_SUPER_MAGIC 0x2fc12fc1
 #endif
 
 } // namespace rr
