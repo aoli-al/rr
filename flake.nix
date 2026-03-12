@@ -48,6 +48,7 @@
         buildInputs = commonBuild;
         cmakeFlags = [
           (pkgs.lib.cmakeBool "BUILD_TESTS" false)
+          (pkgs.lib.cmakeBool "disable32bit" true)
         ];
         enableParallelBuilding = true;
         preCheck = "export HOME=$TMPDIR";
