@@ -1278,6 +1278,7 @@ set(BASIC_TESTS
   prctl_name
   prctl_short_name
   prctl_speculation_ctrl
+  prctl_syscall_user_dispatch
   privileged_net_ioctl
   proc_fds
   proc_mem
@@ -1449,6 +1450,7 @@ set(BASIC_TESTS
   sysinfo
   syslog
   arm/tagged_addr_ctrl
+  arm/sve_vl
   tgkill
   thread_yield
   timer

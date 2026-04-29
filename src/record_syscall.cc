@@ -3797,7 +3797,8 @@ static Switchable did_emulate_read(int syscallno, RecordTask* t,
 {
   syscall_state.emulate_result(result);
   record_ranges(t, ranges, result);
-  if (syscallno == Arch::pread64 || syscallno == Arch::preadv || result <= 0) {
+  if (syscallno == Arch::pread64 || syscallno == Arch::preadv ||
+      syscallno == Arch::preadv2 || result <= 0) {
     // Don't perform this syscall.
     Registers r = t->regs();
     r.set_arg1(-1);
@@ -3821,6 +3822,42 @@ static ParamSize select_param_size(intptr_t nfds, SupportedArch arch) {
     size = ((nfds + long_size*8 - 1)/(long_size*8))*long_size;
   }
   return ParamSize(size);
+}
+
+// RWF_* flags we know rr records correctly. Reject unknown flags so
+// that a future kernel addition whose semantics break rr (e.g. affecting
+// the offset or bytes we record) cannot silently go wrong; the tracee
+// simply sees EINVAL as if running on an older kernel.
+// RWF_APPEND is excluded from the write mask: when set, the kernel
+// ignores the user's offset and uses/updates the current file position,
+// but FileMonitor::retrieve_offset would compute the explicit offset
+// argument and get it wrong.
+enum {
+  RR_RWF_HIPRI     = 0x00000001,
+  RR_RWF_DSYNC     = 0x00000002,
+  RR_RWF_SYNC      = 0x00000004,
+  RR_RWF_NOWAIT    = 0x00000008,
+  RR_RWF_APPEND    = 0x00000010,
+  RR_RWF_NOAPPEND  = 0x00000020,
+  RR_RWF_ATOMIC    = 0x00000040,
+  RR_RWF_DONTCACHE = 0x00000080,
+};
+static const uint32_t RR_KNOWN_PREADV2_FLAGS =
+    RR_RWF_HIPRI | RR_RWF_DSYNC | RR_RWF_SYNC | RR_RWF_NOWAIT |
+    RR_RWF_APPEND | RR_RWF_NOAPPEND | RR_RWF_ATOMIC | RR_RWF_DONTCACHE;
+static const uint32_t RR_KNOWN_PWRITEV2_FLAGS =
+    RR_KNOWN_PREADV2_FLAGS & ~RR_RWF_APPEND;
+
+template <typename Arch>
+static Switchable reject_preadv2_pwritev2(RecordTask* t,
+                                          TaskSyscallState& syscall_state) {
+  syscall_state.emulate_result(-EINVAL);
+  // Point fd at -1 so the kernel short-circuits the syscall with -EBADF;
+  // emulate_result overrides the tracee-visible result to -EINVAL.
+  Registers r = t->regs();
+  r.set_arg1(-1);
+  t->set_regs(r);
+  return PREVENT_SWITCH;
 }
 
 template <typename Arch>
@@ -4556,7 +4593,14 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     case Arch::readv:
     /* ssize_t preadv(int fd, const struct iovec *iov, int iovcnt,
                       off_t offset); */
-    case Arch::preadv: {
+    case Arch::preadv:
+    /* ssize_t preadv2(int fd, const struct iovec *iov, int iovcnt,
+                       off_t offset, int flags); */
+    case Arch::preadv2: {
+      if (syscallno == Arch::preadv2 &&
+          ((uint32_t)regs.arg6() & ~RR_KNOWN_PREADV2_FLAGS)) {
+        return reject_preadv2_pwritev2<Arch>(t, syscall_state);
+      }
       int fd = (int)regs.arg1_signed();
       int iovcnt = (int)regs.arg3_signed();
       remote_ptr<void> iovecsp_void = syscall_state.reg_parameter(
@@ -4579,6 +4623,15 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       for (int i = 0; i < iovcnt; ++i) {
         syscall_state.mem_ptr_parameter(REMOTE_PTR_FIELD(iovecsp + i, iov_base),
                                         io_size.limit_size(iovecs[i].iov_len));
+      }
+      return ALLOW_SWITCH;
+    }
+
+    /* ssize_t pwritev2(int fd, const struct iovec *iov, int iovcnt,
+                        off_t offset, int flags); */
+    case Arch::pwritev2: {
+      if ((uint32_t)regs.arg6() & ~RR_KNOWN_PWRITEV2_FLAGS) {
+        return reject_preadv2_pwritev2<Arch>(t, syscall_state);
       }
       return ALLOW_SWITCH;
     }
@@ -4792,6 +4845,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case PR_GET_SECUREBITS:
         case PR_GET_TAGGED_ADDR_CTRL:
         case PR_GET_MDWE:
+        case PR_SVE_GET_VL:
+        case PR_SVE_SET_VL:
           break;
 
         case PR_SET_TAGGED_ADDR_CTRL:
@@ -4933,6 +4988,16 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
           syscall_state.reg_parameter(
               2, ParamSize::from_syscall_result<typename Arch::ssize_t>(
                   (size_t)regs.arg3()));
+          break;
+        }
+
+        case PR_SET_SYSCALL_USER_DISPATCH: {
+          // Prevent any PR_SET_SYSCALL_USER_DISPATCH call and pretend it's not
+          // supported.
+          Registers r = regs;
+          r.set_arg1(intptr_t(-1));
+          t->set_regs(r);
+          syscall_state.emulate_result(-EINVAL);
           break;
         }
 
@@ -7272,6 +7337,8 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::pkey_mprotect:
     case Arch::pread64:
     case Arch::preadv:
+    case Arch::preadv2:
+    case Arch::pwritev2:
     case Arch::ptrace:
     case Arch::read:
     case Arch::readv:
